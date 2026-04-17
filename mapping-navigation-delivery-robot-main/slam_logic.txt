@@ -1,0 +1,317 @@
+
+SLAM-Based Exploration with Frontier Detection + DWA + Right-Hand Rule Fallback
+
+==============================================================================
+HIGH-LEVEL ARCHITECTURE
+==============================================================================
+
+1. FRONTIER-BASED EXPLORATION (primary):
+   - Detect frontier cells (boundary between free and unknown space) within a
+     configurable search radius around the robot.
+   - Navigate to the nearest/most promising frontier to explore unknown areas.
+   - Provides both global goal selection and local velocity commands.
+
+2. DWA (Dynamic Window Approach) Integration (optional):
+   - Can use frontier goals as targets for DWA-based path planning.
+   - DWA will compute smooth, collision-avoiding trajectories toward goals.
+   - Decouples exploration (goal selection) from local motion (DWA control).
+
+3. RIGHT-HAND RULE FALLBACK:
+   - When no frontier is found (entire area explored or blocked), fall back to RHR.
+   - Hugs the right wall and escapes tight situations.
+   - Useful for fully mapped environments (e.g., after SLAM is complete).
+
+4. REAL-TIME OPERATION:
+   - Live occupancy grid (from scan matching + lidar).
+   - Frontier detection runs on each iteration (low-cost).
+   - No need to save/load map first; custom navigation works in real time.
+
+Output:
+   - Frontier goals: (x, y) waypoints for DWA or direct pursuit.
+   - Velocity commands: (v_ref, omega_ref) for low-level motor control.
+   - Fallback commands: RHR decisions when exploration is complete.
+
+Usage:
+   - In main.py:
+     frontier_goal = get_frontier_goal(occupancy_grid, x, y)
+     if frontier_goal:
+         use DWA or direct pursuit to move toward frontier_goal
+     else:
+         use right_hand_rule(scan) for obstacle avoidance
+
+==============================================================================
+COLLISION DETECTION STRATEGIES: SECTOR vs CIRCLE vs POLYGON
+==============================================================================
+
+Current implementation uses SECTOR-BASED collision detection. Below is a
+detailed comparison of three collision detection approaches used in mobile
+robotics:
+
+────────────────────────────────────────────────────────────────────────────
+1. SECTOR-BASED COLLISION DETECTION (CURRENT)
+────────────────────────────────────────────────────────────────────────────
+
+How it works:
+   - Divide lidar scan into angular sectors (front, back, left, right).
+   - Compute min/max distance in each sector.
+   - Compare sector distances to fixed thresholds (FRONT_BLOCK, SIDE_CLEAR).
+   - Example: if front_min < 0.45m, front is blocked; turn away.
+
+Implementation:
+   - extract_sector_distances(scan) → (front_min, right_min, left_min, back_min, front_max)
+   - right_hand_rule_decision(left, front, right) uses thresholds.
+   - Simple, real-time, low CPU cost.
+
+Pros:
+   ✓ FAST: Single pass through scan, O(N) where N = lidar points (~400).
+   ✓ REACTIVE: Responds immediately to nearby obstacles in raw sensor frame.
+   ✓ SIMPLE: No grid lookups, no distance transforms, no overhead.
+   ✓ SENSOR-ALIGNED: Sectors match lidar FOV naturally; no coordinate transforms.
+   ✓ DIRECTIONAL: Can tune different thresholds per sector (front more conservative).
+   ✓ ROBUST TO GRID ERRORS: Works even if occupancy grid is coarse or outdated.
+   ✓ GOOD FOR RHR: Natural fit for wall-following (left/right distance feedback).
+
+Cons:
+   ✗ POINT-BASED: Only checks actual scan points; gaps between rays can hide obstacles.
+   ✗ NOT FOOTPRINT-AWARE: Doesn't account for robot radius; treats robot as point.
+   ✗ NO AHEAD VISIBILITY: Doesn't look far enough ahead for trajectory validation.
+   ✗ GRID MISMATCH: Doesn't interact well with occupancy grid frontier selection.
+   ✗ COARSE STEERING: Binary per-sector decisions may cause jerky motion.
+   ✗ POOR TRAJECTORY EVAL: Can't validate full paths (needed for DWA).
+   ✗ INFLEXIBLE GEOMETRY: Assumes robot is rotationally symmetric; ignores actual shape.
+
+When to use:
+   - Simple obstacle avoidance and wall-following (RHR).
+   - Low-compute environments or embedded systems with limited CPU.
+   - When reactivity to immediate nearby threats is more important than path planning.
+   - Combined with frontier goals, not as primary path planner.
+
+Current usage in this code:
+   - Used in process_lidar_for_exploration() for emergency stops (front < 0.2m).
+   - Used in process_lidar_simple() for pure RHR navigation.
+   - Complements frontier selection (occupancy grid keeps track of larger picture).
+
+────────────────────────────────────────────────────────────────────────────
+2. CIRCLE FOOTPRINT COLLISION DETECTION
+────────────────────────────────────────────────────────────────────────────
+
+How it works:
+   - Model robot as a circle with radius R (typically half the robot width).
+   - At each decision point (or along a trajectory), check if circle overlaps obstacles.
+   - Convert occupancy grid: mark cells as obstacles if within distance R of real obstacles.
+   - Can use:
+     a) Naive check: iterate grid cells within R of robot; O(R²) per check.
+     b) Distance transform: precompute Euclidean distance to nearest obstacle; O(1) lookup.
+
+Implementation:
+   def is_circle_free(occupancy_grid, x_world, y_world, radius_m, cell_size):
+       grid_h, grid_w = occupancy_grid.shape
+       cx = int(grid_w // 2 + x_world / cell_size)
+       cy = int(grid_h // 2 + y_world / cell_size)
+       r_cells = int(np.ceil(radius_m / cell_size))
+       # Check all cells within circle
+       ys, xs = np.ogrid[cy-r_cells:cy+r_cells+1, cx-r_cells:cx+r_cells+1]
+       dist2 = (xs - cx)**2 + (ys - cy)**2
+       mask = dist2 <= (r_cells**2)
+       return not np.any((occupancy_grid[mask] >= 50) & mask)  # no obstacles in circle
+
+Pros:
+   ✓ FOOTPRINT-AWARE: Accounts for robot size; conservative and safe.
+   ✓ GRID-BASED: Integrates naturally with occupancy grid frontier selection.
+   ✓ SIMPLE GEOMETRY: Circle is easy to compute; no complex shapes.
+   ✓ DETERMINISTIC: Consistent collision detection across grid.
+   ✓ DWA-FRIENDLY: Can sample trajectory points and validate all with one function.
+   ✓ SAFE FOR STATIC OBSTACLES: Guaranteed not to clip stationary obstacles.
+
+Cons:
+   ✗ OVER-CONSERVATIVE in tight spaces: May block valid passages through narrow corridors.
+   ✗ COARSE GRID RESOLUTION: If grid is 5cm/pixel, hard to navigate 5cm passages.
+   ✗ SLOWER THAN SECTORS: O(R²) per check (naive) or O(N_grid) preprocessing (transform).
+   ✗ GRID DEPENDENT: Only as good as occupancy grid; if grid lags, collisions possible.
+   ✗ LOSES POINT-LEVEL DETAIL: Occupancy grid coarser than raw lidar.
+   ✗ CIRCLES ARE SUBOPTIMAL: Real robots aren't circular (e.g., rectangular, with arms).
+
+When to use:
+   - DWA trajectory evaluation (sample poses along path; verify all clear).
+   - Frontier goal validation (filter unreachable frontiers).
+   - Conservative navigation with guaranteed collision avoidance.
+   - Environments with known static obstacles but dynamic uncertainties.
+
+Recommended radius for typical differential-drive robot: 0.15–0.25m (half robot width).
+
+────────────────────────────────────────────────────────────────────────────
+3. POLYGON FOOTPRINT COLLISION DETECTION (PREFERRED FOR REAL ROBOTS)
+────────────────────────────────────────────────────────────────────────────
+
+How it works:
+   - Model robot as a convex polygon (e.g., rectangle, hexagon).
+   - Check if polygon overlaps obstacles in occupancy grid.
+   - More accurate than circle for rectangular robots.
+   - Can use:
+     a) Grid sweep: iterate robot polygon vertices and grid cells near each.
+     b) Rotated polygon check: apply robot's current θ; check cells within rotated bounds.
+     c) Distance field + vertex checks: efficient hybrid.
+
+Implementation sketch (more complex):
+   def is_polygon_free(occupancy_grid, x_world, y_world, theta, robot_polygon, cell_size):
+       # robot_polygon: list of (dx, dy) relative to robot center in local frame
+       # Transform to world frame, rotate by theta, check occupancy
+       world_polygon = rotate_and_translate_polygon(robot_polygon, theta, x_world, y_world)
+       for (wx, wy) in world_polygon:
+           gx = int(grid_w // 2 + wx / cell_size)
+           gy = int(grid_h // 2 + wy / cell_size)
+           if 0 <= gx < grid_w and 0 <= gy < grid_h:
+               if occupancy_grid[gy, gx] >= 50:  # obstacle
+                   return False
+       return True
+
+Pros:
+   ✓ ACCURATE GEOMETRY: Matches real robot shape (rectangle, hex, etc.).
+   ✓ ORIENTATION-AWARE: Considers robot heading θ; tighter collision bounds.
+   ✓ FOOTPRINT-AWARE: Conservative, safe, and less wasteful than circles.
+   ✓ GRID-BASED: Integrates with occupancy grid like circle approach.
+   ✓ DWA-IDEAL: Can validate sampled trajectories with orientation.
+   ✓ LESS CONSERVATIVE: More likely to find passages circles would block.
+
+Cons:
+   ✗ MORE COMPLEX CODE: Needs polygon transforms, rotation, vertex iteration.
+   ✗ SLIGHTLY SLOWER: O(P * R²) where P = polygon vertices (typically 4–8).
+   ✗ REQUIRES ROBOT GEOMETRY: Must define polygon in constants.
+   ✗ STILL GRID-DEPENDENT: Accuracy limited by grid resolution.
+   ✗ THETA ADDS DIMENSION: State is 3D (x, y, θ); adds complexity to frontier selection.
+
+When to use:
+   - Production robots where accuracy matters (autonomous vehicles, manipulators).
+   - DWA with full 3D trajectory sampling (x, y, θ).
+   - Narrow or cluttered environments where less wasted space is critical.
+   - Custom navigation with known robot CAD model.
+
+Typical polygon for differential-drive robot:
+   Robot footprint (front-to-back L, side-to-side W):
+   [(L/2, W/2), (L/2, -W/2), (-L/2, -W/2), (-L/2, W/2)]  # rectangle in local frame
+
+────────────────────────────────────────────────────────────────────────────
+HYBRID RECOMMENDATIONS FOR THIS CODEBASE
+────────────────────────────────────────────────────────────────────────────
+
+Current strategy (SECTOR + FRONTIER):
+   - Use sectors for IMMEDIATE obstacle avoidance (RHR fallback).
+   - Use frontier detection on occupancy grid for EXPLORATION goals.
+   - No explicit footprint collision at frontier selection stage.
+   - Risk: frontier goal might be in a tight space; robot has to navigate carefully.
+
+Recommended enhancement (POLYGON + FRONTIER):
+   1. Keep sectors for RHR emergency fallback (fast, reactive).
+   2. Add polygon collision check to frontier selection:
+      - Filter frontier goals with is_polygon_free(...) before returning.
+      - This guarantees frontiers are reachable without inflating whole grid.
+   3. If DWA is added later:
+      - Sample trajectory poses (x, y, θ).
+      - Validate each pose with is_polygon_free(...).
+      - Ensures smooth paths without jerky collision avoidance.
+   4. Occupancy grid still holds full information; sectors provide fast override.
+
+Benefits of this hybrid:
+   ✓ Best of both worlds: fast sectors + accurate footprint.
+   ✓ Incremental: add polygon checks without rewriting frontier detection.
+   ✓ Scalable: sectors stay for emergency, polygon for planning.
+   ✓ Real-time: sector checks <1ms; polygon checks ~1–5ms per pose.
+
+Example integration:
+   # In get_frontier_goal()
+   frontiers = detect_frontiers(...)
+   reachable = [f for f in frontiers if is_polygon_free(occ_grid, f[0], f[1], 0, robot_poly)]
+   if reachable:
+       return min(reachable, key=lambda f: dist_to_robot(f))
+   else:
+       return None
+
+────────────────────────────────────────────────────────────────────────────
+DECISION MATRIX
+────────────────────────────────────────────────────────────────────────────
+
+                        │ Sector │ Circle │ Polygon
+                        ├────────┼────────┼─────────
+Speed (per check)       │ O(N)   │ O(R²)  │ O(P*R²)
+CPU Cost (real-time)    │ <1ms   │ 1-5ms  │ 2-10ms
+Accuracy                │ Point  │ Okay   │ Excellent
+Conservative            │ No     │ Yes    │ Yes
+Grid Integration        │ Poor   │ Good   │ Good
+DWA Compatible          │ No     │ Yes    │ Yes
+RHR Friendly            │ Yes    │ No     │ No
+Code Complexity         │ Low    │ Medium │ High
+Handles Narrow Spaces   │ Maybe  │ Often  │ Usually
+────────────────────────────────────────────────────────────────────────────
+
+Recommended choice for this SLAM robot:
+   ► USE POLYGON for frontier validation + DWA (best accuracy & reachability).
+   ► KEEP SECTORS for RHR emergency fallback (fast, proven).
+   ► This gives you safety, real-time performance, and accurate exploration.
+
+
+
+def process_lidar_simple(scan):
+    """
+    Fallback: simple right-hand rule only (no exploration or grid).
+    Use this for basic obstacle avoidance testing.
+    
+    Args:
+        scan: lidar scan
+    
+    Returns:
+        (v_ref, omega_ref): velocity commands
+    """
+
+
+def rotate_polygon(polygon, angle_rad):
+    Rotate a polygon (list of (x, y)) by angle_rad around origin.
+    
+    Args:
+        polygon: list of (x, y) tuples in local frame
+        angle_rad: rotation angle in radians
+    
+    Returns:
+        rotated_polygon: list of (x, y) tuples
+    
+
+
+def is_polygon_free(occupancy_grid, x_world, y_world, theta_world, robot_polygon, cell_size=CELL_SIZE):
+    
+    Check if a RECTANGULAR ROBOT FOOTPRINT around (x_world, y_world) is collision-free.
+    
+    Polygon collision check: applies robot's current heading θ to polygon vertices,
+    then checks if any occupied grid cells overlap the robot's rectangle.
+    
+    ROBOT FOOTPRINT (from constants.py):
+    ├─ Width (side-to-side): 0.50m
+    ├─ Length (front-to-back): 0.35m
+    ├─ Vertices: rectangle corners rotated by robot heading θ
+    └─ Conservative: any occupied cell in footprint = collision
+    
+    Args:
+        occupancy_grid: numpy array (GRID_SIZE x GRID_SIZE), 0=unknown, 1=free, 100=occupied
+        x_world, y_world: robot center position in world coordinates (meters)
+        theta_world: robot heading in radians ([-π, π])
+        robot_polygon: list of (dx, dy) tuples for rectangle corners in local frame
+                       From constants.ROBOT_FOOTPRINT:
+                       [(0.25, 0.175), (0.25, -0.175), (-0.25, -0.175), (-0.25, 0.175)]
+        cell_size: grid cell size in meters (from constants.CELL_SIZE = 0.1m)
+    
+    Returns:
+        True if robot rectangle is free (no collisions), False if collision detected
+    
+    Collision Detection Strategy:
+        1. Rotate rectangle by robot heading θ
+        2. Translate to world position (x, y)
+        3. Convert to grid coordinates
+        4. Check all cells within bounding box
+        5. If any occupied cell (val >= 50) is inside rectangle → collision
+    
+    Example usage:
+        # Check if robot can be at (1.0, 2.0) heading north (θ=π/2)
+        safe = is_polygon_free(occupancy_grid, 1.0, 2.0, np.pi/2, ROBOT_FOOTPRINT)
+        
+        # In frontier filtering (get_frontier_goal):
+        reachable = [f for f in frontiers if is_polygon_free(occ_grid, f[0], f[1], 0, ROBOT_FOOTPRINT)]
+    
+
